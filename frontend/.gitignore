@@ -7,6 +7,5 @@ build/
 *.log
 npm-debug.log*
 .vite/
-/.venv
-./MD_Files/
+MD_Files/
 
