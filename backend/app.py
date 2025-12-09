@@ -1,7 +1,7 @@
 import os
 from flask import Flask, jsonify
 from flask_cors import CORS
-from flask_jwt_extended import JWTManager
+from flask_jwt_extended import JWTManager, jwt_required, get_jwt_identity
 from dotenv import load_dotenv
 from models import db, User, Course, Enrollment
 from auth import register_auth_routes, admin_required
@@ -31,7 +31,16 @@ CORS(
     app,
     resources={
         r"/api/*": {
-            "origins": ["http://localhost:3000", "http://127.0.0.1:3000"],
+            "origins": [
+                "http://localhost:3000",
+                "http://127.0.0.1:3000",
+                "http://localhost:3007",
+                "http://127.0.0.1:3007",
+                "http://localhost:5173",
+                "http://127.0.0.1:5173",
+                "http://localhost:3001",
+                "http://127.0.0.1:3001",
+            ],
             "allow_headers": ["Content-Type", "Authorization"],
             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
             "supports_credentials": True,
@@ -148,41 +157,47 @@ def delete_course(course_id):
 
 
 @app.route("/api/enrollments", methods=["POST"])
+@jwt_required()
 def enroll_course():
     """Enroll a student in a course."""
     from flask import request
-    from flask_jwt_extended import jwt_required, get_jwt_identity
 
-    @jwt_required()
-    def _enroll():
-        user_id = get_jwt_identity()
-        data = request.get_json()
+    user_id = int(get_jwt_identity())
+    data = request.get_json()
 
-        if not data or not data.get("course_id"):
-            return jsonify({"error": "Course ID is required"}), 400
+    if not data or not data.get("course_id"):
+        return jsonify({"error": "Course ID is required"}), 400
 
-        course = Course.query.get(data["course_id"])
-        if not course:
-            return jsonify({"error": "Course not found"}), 404
+    course = Course.query.get(data["course_id"])
+    if not course:
+        return jsonify({"error": "Course not found"}), 404
 
-        existing = Enrollment.query.filter_by(
-            user_id=user_id, course_id=data["course_id"]
-        ).first()
-        if existing:
-            return jsonify({"error": "Already enrolled in this course"}), 400
+    if len(course.enrollments) >= course.capacity:
+        return jsonify({"error": "Course is full"}), 400
 
-        enrollment = Enrollment(user_id=user_id, course_id=data["course_id"])
-        db.session.add(enrollment)
-        db.session.commit()
+    existing = Enrollment.query.filter_by(
+        user_id=user_id, course_id=data["course_id"]
+    ).first()
+    if existing:
+        return jsonify({"error": "Already enrolled in this course"}), 400
 
-        return jsonify(enrollment.to_dict()), 201
+    enrollment = Enrollment(user_id=user_id, course_id=data["course_id"])
+    db.session.add(enrollment)
+    db.session.commit()
 
-    return _enroll()
+    return jsonify(enrollment.to_dict()), 201
 
 
 @app.route("/api/enrollments/user/<int:user_id>", methods=["GET"])
+@jwt_required()
 def get_user_enrollments(user_id):
     """Get enrollments for a specific user."""
+    current_user_id = int(get_jwt_identity())
+    current_user = User.query.get(current_user_id)
+
+    if current_user_id != user_id and current_user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
     enrollments = Enrollment.query.filter_by(user_id=user_id).all()
     return jsonify([e.to_dict() for e in enrollments]), 200
 
@@ -211,39 +226,59 @@ def get_user(user_id):
 
 
 @app.route("/api/users/<int:user_id>", methods=["PUT"])
+@jwt_required()
 def update_user(user_id):
     """Update user profile."""
     from flask import request
-    from flask_jwt_extended import jwt_required, get_jwt_identity
 
-    @jwt_required()
-    def _update():
-        current_user_id = get_jwt_identity()
+    current_user_id = int(get_jwt_identity())
 
-        # Users can only update their own profile unless they're admin
-        user = User.query.get(user_id)
-        if not user:
-            return jsonify({"error": "User not found"}), 404
+    # Users can only update their own profile unless they're admin
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({"error": "User not found"}), 404
 
-        current_user = User.query.get(current_user_id)
-        if current_user_id != user_id and current_user.role != "admin":
-            return jsonify({"error": "Unauthorized"}), 403
+    current_user = User.query.get(current_user_id)
+    if current_user_id != user_id and current_user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
 
-        data = request.get_json()
+    data = request.get_json()
 
-        if "email" in data:
-            existing = User.query.filter_by(email=data["email"]).first()
-            if existing and existing.id != user_id:
-                return jsonify({"error": "Email already in use"}), 400
-            user.email = data["email"]
+    if "email" in data:
+        existing = User.query.filter_by(email=data["email"]).first()
+        if existing and existing.id != user_id:
+            return jsonify({"error": "Email already in use"}), 400
+        user.email = data["email"]
 
-        if "password" in data:
-            user.set_password(data["password"])
+    if "password" in data:
+        user.set_password(data["password"])
 
-        db.session.commit()
-        return jsonify(user.to_dict()), 200
+    db.session.commit()
+    return jsonify(user.to_dict()), 200
 
-    return _update()
+
+# ==================== JWT ERROR HANDLERS ====================
+
+
+@jwt.invalid_token_loader
+def invalid_token_callback(error):
+    print(f"JWT Error Debug: {error}")
+    return jsonify({"error": "Invalid token", "details": error}), 422
+
+
+@jwt.unauthorized_loader
+def missing_token_callback(error):
+    return (
+        jsonify(
+            {"error": "Request does not contain an access token", "details": error}
+        ),
+        401,
+    )
+
+
+@jwt.expired_token_loader
+def expired_token_callback(jwt_header, jwt_payload):
+    return jsonify({"error": "Token has expired", "details": "token_expired"}), 401
 
 
 # ==================== HEALTH CHECK ====================
@@ -296,7 +331,7 @@ def init_db():
 
             # Create sample instructor
             instructor = User(
-                username="instructor1",
+                username="Prof. Sarah Johnson",
                 email="instructor@campushub.com",
                 role="instructor",
             )
@@ -311,24 +346,56 @@ def init_db():
                 description="Learn Python basics from scratch.",
                 instructor_id=instructor.id,
                 capacity=50,
+                image_url="/images/python-intro.png"
             )
             course2 = Course(
                 title="Web Development with React",
                 description="Master React and modern web development.",
                 instructor_id=instructor.id,
                 capacity=40,
+                image_url="/images/react-dev.png"
             )
             course3 = Course(
                 title="Database Design with SQL",
                 description="Learn to design and optimize databases.",
                 instructor_id=instructor.id,
                 capacity=35,
+                image_url="/images/sql-design.png"
             )
 
             db.session.add_all([course1, course2, course3])
             db.session.commit()
 
             print("Database initialized with sample data!")
+
+
+@app.route("/api/fix_images", methods=["GET"])
+def fix_images():
+    """Temporary route to fix image URLs."""
+    try:
+        # Update Instructor
+        instructor = User.query.filter_by(email="instructor@campushub.com").first()
+        if instructor:
+            instructor.username = "Prof. Sarah Johnson"
+            
+        # Update Courses
+        courses = Course.query.all()
+        updated_count = 0
+        for course in courses:
+            if "Python" in course.title:
+                course.image_url = "/images/python-intro.png"
+                updated_count += 1
+            elif "React" in course.title:
+                course.image_url = "/images/react-dev.png"
+                updated_count += 1
+            elif "SQL" in course.title:
+                course.image_url = "/images/sql-design.png"
+                updated_count += 1
+        
+        db.session.commit()
+        return jsonify({"message": f"Updated {updated_count} courses"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
